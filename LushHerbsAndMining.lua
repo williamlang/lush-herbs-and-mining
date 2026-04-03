@@ -23,11 +23,8 @@ local LUSH_KEYWORDS = {
 }
 
 -- Numeric fileIDs that indicate a Lush/Rich node blip.
--- -2925 appears on the blip with more regions in debug output and is a
--- tentative match — confirm by testing and add/remove IDs here as needed.
-local LUSH_FILE_IDS = {
-    [-2925] = true,
-}
+-- Populate these once debug output confirms which ID is unique to lush nodes.
+local LUSH_FILE_IDS = {}
 
 -- ============================================================
 -- Runtime state
@@ -158,7 +155,11 @@ local function ScanMinimap()
 
     -- 2. Inspect every child of the Minimap frame.
     for _, child in ipairs({Minimap:GetChildren()}) do
-        if child:IsShown() and child:GetNumRegions() > 0 then
+        local w, h = child:GetWidth(), child:GetHeight()
+        -- Skip frames that are too large to be tracking blips (UI chrome, borders, etc.)
+        -- Real blips are roughly 10-16 px; anything over 30 px is not a blip.
+        local isBlipSized = (w > 0 and w <= 30) and (h > 0 and h <= 30)
+        if isBlipSized and child:IsShown() and child:GetNumRegions() > 0 then
             local isNew  = knownBlips[child] == nil
             local isLush = BlipIsLush(child)
 
