@@ -1,0 +1,9 @@
+## Interface: 110100
+## Interface-Retail: 110100
+## Title: Lush Herbs & Mining
+## Notes: Highlights Lush herb and Rich/abundant mining nodes on the minimap with a pulsing glow.
+## Author:
+## Version: 1.0.0
+## SavedVariables: LHM_Config
+
+LushHerbsAndMining.lua
