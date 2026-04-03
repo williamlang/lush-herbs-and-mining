@@ -14,13 +14,19 @@ local DEFAULTS = {
     debug         = false,  -- when true, prints atlas names of every new blip
 }
 
--- Keywords matched (case-insensitive) against each region's atlas name.
--- Add more here once /lhm debug reveals the real atlas strings in-game.
+-- Keywords matched (case-insensitive) against string atlas/texture names.
 local LUSH_KEYWORDS = {
     "lush",
     "rich",
     "abundant",
     "bountiful",
+}
+
+-- Numeric fileIDs that indicate a Lush/Rich node blip.
+-- -2925 appears on the blip with more regions in debug output and is a
+-- tentative match — confirm by testing and add/remove IDs here as needed.
+local LUSH_FILE_IDS = {
+    [-2925] = true,
 }
 
 -- ============================================================
@@ -45,39 +51,48 @@ local function IsLushString(s)
     return false
 end
 
---- Returns true when any Texture region on `blip` has a lush-keyword
---- atlas name OR a lush-keyword file-path texture.
+--- Returns true when any Texture region on `blip` signals a Lush/Rich node:
+---   • atlas or string texture contains a LUSH_KEYWORDS entry, OR
+---   • numeric texture fileID is in LUSH_FILE_IDS.
 local function BlipIsLush(blip)
     for i = 1, blip:GetNumRegions() do
         local r = select(i, blip:GetRegions())
         if r and r:GetObjectType() == "Texture" then
-            if IsLushString(r:GetAtlas())   then return true end
-            if IsLushString(r:GetTexture()) then return true end
+            if IsLushString(r:GetAtlas()) then return true end
+            local tex = r:GetTexture()
+            if type(tex) == "string" and IsLushString(tex)  then return true end
+            if type(tex) == "number" and LUSH_FILE_IDS[tex] then return true end
         end
     end
     return false
 end
 
---- Prints every atlas name and texture path found on `blip` (debug helper).
+--- Prints every atlas/texture on `blip` plus its screen position (debug helper).
 local function PrintBlipInfo(blip)
+    local cx, cy = blip:GetCenter()
+    print(string.format("|cffff8000[LHM Debug]|r   pos=(%.0f,%.0f)  regions=%d",
+        cx or 0, cy or 0, blip:GetNumRegions()))
+
     local found = false
     for i = 1, blip:GetNumRegions() do
         local r = select(i, blip:GetRegions())
         if r and r:GetObjectType() == "Texture" then
-            local atlas   = r:GetAtlas()
-            local texture = r:GetTexture()  -- string path or numeric fileID
+            local atlas = r:GetAtlas()
+            local tex   = r:GetTexture()
             if atlas then
-                print(string.format("|cffff8000[LHM Debug]|r   atlas[%d]:   %s", i, atlas))
+                print(string.format("|cffff8000[LHM Debug]|r     atlas[%d]:   %s", i, atlas))
                 found = true
             end
-            if texture ~= nil and texture ~= "" then
-                print(string.format("|cffff8000[LHM Debug]|r   texture[%d]: %s", i, tostring(texture)))
+            if tex ~= nil and tex ~= "" then
+                local lushFlag = (type(tex) == "number" and LUSH_FILE_IDS[tex]) and " <-- LUSH?" or ""
+                print(string.format("|cffff8000[LHM Debug]|r     texture[%d]: %s%s",
+                    i, tostring(tex), lushFlag))
                 found = true
             end
         end
     end
     if not found then
-        print("|cffff8000[LHM Debug]|r   (no atlas or texture found)")
+        print("|cffff8000[LHM Debug]|r     (no atlas or texture found)")
     end
 end
 
