@@ -32,43 +32,52 @@ local knownBlips = {}   -- [frame] = true|false  (true = has glow)
 local eventFrame = CreateFrame("Frame")
 
 -- ============================================================
--- Atlas helpers
+-- Texture / atlas helpers
 -- ============================================================
-local function IsLushAtlas(atlas)
-    if not atlas then return false end
-    local lower = atlas:lower()
+
+--- Returns true when `s` (string) contains any LUSH_KEYWORDS entry.
+local function IsLushString(s)
+    if type(s) ~= "string" then return false end
+    local lower = s:lower()
     for _, kw in ipairs(LUSH_KEYWORDS) do
         if lower:find(kw, 1, true) then return true end
     end
     return false
 end
 
---- Returns true when any texture region on `blip` has a lush-keyword atlas.
+--- Returns true when any Texture region on `blip` has a lush-keyword
+--- atlas name OR a lush-keyword file-path texture.
 local function BlipIsLush(blip)
     for i = 1, blip:GetNumRegions() do
         local r = select(i, blip:GetRegions())
-        if r and r.GetAtlas and IsLushAtlas(r:GetAtlas()) then
-            return true
+        if r and r:GetObjectType() == "Texture" then
+            if IsLushString(r:GetAtlas())   then return true end
+            if IsLushString(r:GetTexture()) then return true end
         end
     end
     return false
 end
 
---- Prints all atlas names found on `blip` (debug helper).
-local function PrintBlipAtlases(blip)
+--- Prints every atlas name and texture path found on `blip` (debug helper).
+local function PrintBlipInfo(blip)
     local found = false
     for i = 1, blip:GetNumRegions() do
         local r = select(i, blip:GetRegions())
-        if r and r.GetAtlas then
-            local a = r:GetAtlas()
-            if a then
-                print(string.format("|cffff8000[LHM Debug]|r   atlas[%d]: %s", i, a))
+        if r and r:GetObjectType() == "Texture" then
+            local atlas   = r:GetAtlas()
+            local texture = r:GetTexture()  -- string path or numeric fileID
+            if atlas then
+                print(string.format("|cffff8000[LHM Debug]|r   atlas[%d]:   %s", i, atlas))
+                found = true
+            end
+            if texture ~= nil and texture ~= "" then
+                print(string.format("|cffff8000[LHM Debug]|r   texture[%d]: %s", i, tostring(texture)))
                 found = true
             end
         end
     end
     if not found then
-        print("|cffff8000[LHM Debug]|r   (no atlases – may use file-path textures)")
+        print("|cffff8000[LHM Debug]|r   (no atlas or texture found)")
     end
 end
 
@@ -143,7 +152,7 @@ local function ScanMinimap()
                 print(string.format(
                     "|cffff8000[LHM Debug]|r New minimap child (lush=%s):",
                     tostring(isLush)))
-                PrintBlipAtlases(child)
+                PrintBlipInfo(child)
             end
 
             if isLush then
@@ -230,7 +239,7 @@ SlashCmdList["LHM"] = function(msg)
 
     elseif cmd == "help" or cmd == "" then
         print("|cff00cc44[LHM] Lush Herbs & Mining|r – commands:")
-        print("  |cffffff00/lhm debug|r            toggle debug mode (prints atlas names)")
+        print("  |cffffff00/lhm debug|r            toggle debug mode (prints atlas + texture info)")
         print("  |cffffff00/lhm scan|r              force a full minimap rescan")
         print("  |cffffff00/lhm color <R> <G> <B>|r set glow colour (0–1 each)")
         print("  |cffffff00/lhm help|r              show this message")
