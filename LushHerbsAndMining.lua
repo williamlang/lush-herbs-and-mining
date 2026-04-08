@@ -44,9 +44,11 @@ local function IsLushString(s)
     return false
 end
 
-local function IsBlipSized(frame)
-    local w, h = frame:GetWidth(), frame:GetHeight()
-    return (w > 0 and w <= 30) and (h > 0 and h <= 30)
+--- Returns true if the frame looks like a tracking blip we can probe.
+--- We check for an OnEnter script (tooltip-capable) rather than size,
+--- because WoW may size blip frames at 0x0 or larger than expected.
+local function IsProbeableBlip(frame)
+    return frame:IsShown() and frame:GetScript("OnEnter") ~= nil
 end
 
 -- ============================================================
@@ -145,12 +147,25 @@ end
 --- Probe blips we haven't checked yet (runs frequently).
 local function ProbeNewBlips()
     for _, child in ipairs({Minimap:GetChildren()}) do
-        if child:IsShown() and IsBlipSized(child) and not probedBlips[child] then
+        if child:IsShown() and not probedBlips[child] then
             probedBlips[child] = true
-            local isLush = ProbeBlipTooltip(child)
-            if isLush then
-                ShowGlow(child)
-                lushBlips[child] = true
+
+            local w, h = child:GetWidth(), child:GetHeight()
+            local hasOnEnter = child:GetScript("OnEnter") ~= nil
+
+            if cfg.debug then
+                print(string.format(
+                    "|cffff8000[LHM Debug]|r Child: size=%.0fx%.0f  OnEnter=%s  regions=%d  name=%s",
+                    w, h, tostring(hasOnEnter), child:GetNumRegions(),
+                    child:GetName() or "(nil)"))
+            end
+
+            if hasOnEnter then
+                local isLush = ProbeBlipTooltip(child)
+                if isLush then
+                    ShowGlow(child)
+                    lushBlips[child] = true
+                end
             end
         end
     end
@@ -166,7 +181,7 @@ local function FullReprobe()
     wipe(probedBlips)
 
     for _, child in ipairs({Minimap:GetChildren()}) do
-        if child:IsShown() and IsBlipSized(child) then
+        if IsProbeableBlip(child) then
             probedBlips[child] = true
             local isLush = ProbeBlipTooltip(child)
             if isLush then
