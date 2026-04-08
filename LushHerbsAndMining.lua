@@ -140,6 +140,128 @@ local function WorldToMinimapOffset(nodeX, nodeY)
 end
 
 -- ============================================================
+-- Vignette scanning  (C_VignetteInfo — automatic detection)
+-- ============================================================
+
+-- vignetteGUID → true for vignettes we've already created pins for
+local trackedVignettes = {}
+
+local function ScanVignettes()
+    if not C_VignetteInfo then return end
+
+    local guids = C_VignetteInfo.GetVignettes()
+    if not guids then return end
+
+    local mapID = C_Map.GetBestMapForUnit("player")
+    if not mapID then return end
+
+    -- Mark all current vignette GUIDs so we can detect stale ones.
+    local activeGUIDs = {}
+
+    for _, guid in ipairs(guids) do
+        local info = C_VignetteInfo.GetVignetteInfo(guid)
+        if info and info.name then
+
+            if cfg.debug and not trackedVignettes[guid] then
+                print(string.format(
+                    "|cffff8000[LHM Debug]|r Vignette: '%s'  type=%s  onMinimap=%s",
+                    info.name,
+                    tostring(info.type),
+                    tostring(info.onMinimap)))
+            end
+
+            if IsLushString(info.name) then
+                activeGUIDs[guid] = true
+
+                if not trackedVignettes[guid] then
+                    -- Try to get the vignette's map position.
+                    local pos = C_VignetteInfo.GetVignettePosition
+                                and C_VignetteInfo.GetVignettePosition(guid, mapID)
+                    if pos then
+                        local mapX, mapY = pos:GetXY()
+                        -- Convert map coords (0-1) to world coords.
+                        local _, worldPos = C_Map.GetWorldPosFromMapPos(mapID,
+                                                CreateVector2DMixin and CreateVector2DMixin(mapX, mapY)
+                                                or CreateVector2D(mapX, mapY))
+                        if worldPos then
+                            local wx, wy = worldPos:GetXY()
+                            local _, _, _, instanceID = UnitPosition("player")
+                            -- Deduplicate against existing detectedNodes.
+                            local dominated = false
+                            for _, node in ipairs(detectedNodes) do
+                                if node.instance == instanceID then
+                                    local d = (node.x - wx) ^ 2 + (node.y - wy) ^ 2
+                                    if d < 225 then
+                                        node.time = GetTime()
+                                        dominated = true
+                                        break
+                                    end
+                                end
+                            end
+                            if not dominated and instanceID then
+                                table.insert(detectedNodes, {
+                                    x = wx, y = wy,
+                                    instance = instanceID,
+                                    time = GetTime(),
+                                    name = info.name,
+                                    vignetteGUID = guid,
+                                })
+                                if cfg.debug then
+                                    print(string.format(
+                                        "|cff00ff00[LHM]|r Vignette lush node: '%s' at map (%.4f, %.4f)",
+                                        info.name, mapX, mapY))
+                                end
+                            end
+                        end
+                    else
+                        -- No position API — fall back to player position.
+                        local uy, ux, _, instanceID = UnitPosition("player")
+                        if uy and instanceID then
+                            local dominated = false
+                            for _, node in ipairs(detectedNodes) do
+                                if node.instance == instanceID then
+                                    local d = (node.x - ux) ^ 2 + (node.y - uy) ^ 2
+                                    if d < 225 then
+                                        node.time = GetTime()
+                                        dominated = true
+                                        break
+                                    end
+                                end
+                            end
+                            if not dominated then
+                                table.insert(detectedNodes, {
+                                    x = ux, y = uy,
+                                    instance = instanceID,
+                                    time = GetTime(),
+                                    name = info.name,
+                                    vignetteGUID = guid,
+                                })
+                            end
+                        end
+                    end
+                    trackedVignettes[guid] = true
+                end
+            end
+        end
+    end
+
+    -- Clean up vignettes that have despawned.
+    for guid in pairs(trackedVignettes) do
+        if not activeGUIDs[guid] then
+            trackedVignettes[guid] = nil
+            -- Remove the matching detectedNode entry so its pin expires.
+            for i = #detectedNodes, 1, -1 do
+                if detectedNodes[i].vignetteGUID == guid then
+                    local pin = nodePins[detectedNodes[i]]
+                    if pin then ReleasePin(pin); nodePins[detectedNodes[i]] = nil end
+                    table.remove(detectedNodes, i)
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================
 -- Pin positioning (called every frame-ish)
 -- ============================================================
 
@@ -224,6 +346,9 @@ end
 -- ============================================================
 
 eventFrame:RegisterEvent("ADDON_LOADED")
+eventFrame:RegisterEvent("VIGNETTE_MINIMAP_UPDATED")
+eventFrame:RegisterEvent("VIGNETTES_UPDATED")
+eventFrame:RegisterEvent("PLAYER_SOFT_INTERACT_CHANGED")
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
@@ -233,18 +358,63 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         end
         cfg = LHM_Config
         SetupTooltipHook()
-        print("|cff00cc44[Lush Herbs & Mining]|r loaded.  Hover over world nodes to detect Lush/Rich.")
+        print("|cff00cc44[Lush Herbs & Mining]|r loaded.")
         print("  Type |cffffff00/lhm help|r for commands.")
+
+    elseif event == "VIGNETTE_MINIMAP_UPDATED" or event == "VIGNETTES_UPDATED" then
+        ScanVignettes()
+
+    elseif event == "PLAYER_SOFT_INTERACT_CHANGED" then
+        -- Fires when the game auto-highlights a nearby interactable object.
+        local name = UnitName("softinteract")
+        if name and IsLushString(name) then
+            local uy, ux, _, instanceID = UnitPosition("player")
+            if uy and instanceID then
+                -- Deduplicate within 15 yd.
+                for _, node in ipairs(detectedNodes) do
+                    if node.instance == instanceID then
+                        local d = (node.x - ux) ^ 2 + (node.y - uy) ^ 2
+                        if d < 225 then
+                            node.time = GetTime()
+                            uy = nil
+                            break
+                        end
+                    end
+                end
+                if uy then
+                    table.insert(detectedNodes, {
+                        x = ux, y = uy,
+                        instance = instanceID,
+                        time = GetTime(),
+                        name = name,
+                    })
+                    if cfg.debug then
+                        print(string.format(
+                            "|cff00ff00[LHM]|r Soft-interact lush: '%s' at (%.0f, %.0f)",
+                            name, ux, uy))
+                    end
+                end
+            end
+        end
     end
 end)
 
 local updateThrottle = 0
+local vignetteThrottle = 0
 eventFrame:SetScript("OnUpdate", function(self, elapsed)
     if not cfg then return end
+
     updateThrottle = updateThrottle + elapsed
-    if updateThrottle < 0.05 then return end   -- ~20 updates/sec
-    updateThrottle = 0
-    UpdatePins()
+    if updateThrottle >= 0.05 then             -- ~20 updates/sec for pin positioning
+        updateThrottle = 0
+        UpdatePins()
+    end
+
+    vignetteThrottle = vignetteThrottle + elapsed
+    if vignetteThrottle >= 2.0 then            -- scan vignettes every 2 sec
+        vignetteThrottle = 0
+        ScanVignettes()
+    end
 end)
 
 -- ============================================================
