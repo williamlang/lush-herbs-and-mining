@@ -4,32 +4,34 @@ local ADDON_NAME = ...
 -- Default config  (merged with SavedVariables on load)
 -- ============================================================
 local DEFAULTS = {
-    glowR         = 0.2,    -- glow colour: red
-    glowG         = 1.0,    --              green
-    glowB         = 0.0,    --              blue
-    glowAlpha     = 0.85,   -- peak opacity of the glow
-    glowExtra     = 10,     -- pixels added beyond the icon edge
-    pulseDuration = 0.9,    -- seconds for one half-pulse (BOUNCE doubles it)
-    probeInterval = 1.0,    -- seconds between checks for new blips
-    reprobeInterval = 8.0,  -- seconds between full re-probes (handles frame recycling)
+    glowR         = 0.2,
+    glowG         = 1.0,
+    glowB         = 0.0,
+    glowAlpha     = 0.85,
+    pinSize       = 14,
+    pulseDuration = 0.9,
+    expirySeconds = 300,   -- pins disappear after 5 min
     debug         = false,
 }
 
 -- Tooltip keywords (case-insensitive) that mark a Lush / Rich node.
-local LUSH_KEYWORDS = {
-    "lush",
-    "rich",
-}
+local LUSH_KEYWORDS = { "lush", "rich" }
 
 -- ============================================================
 -- Runtime state
 -- ============================================================
-local cfg                   -- populated in ADDON_LOADED
-local probeTimer   = 0
-local reprobeTimer = 0
-local lushBlips    = {}     -- [frame] = true  (highlighted frames)
-local probedBlips  = {}     -- [frame] = true  (already tooltip-checked)
-local eventFrame   = CreateFrame("Frame")
+local cfg
+local eventFrame = CreateFrame("Frame")
+
+-- Detected lush node positions (approx, based on player pos at detection).
+-- { { x=worldX, y=worldY, instance=id, time=t, name=s }, ... }
+local detectedNodes = {}
+
+-- node-table → pin-frame mapping
+local nodePins = {}
+
+-- Recycled pin frames
+local pinPool = {}
 
 -- ============================================================
 -- Helpers
@@ -44,160 +46,184 @@ local function IsLushString(s)
     return false
 end
 
---- Returns true if the frame looks like a tracking blip we can probe.
---- We check for an OnEnter script (tooltip-capable) rather than size,
---- because WoW may size blip frames at 0x0 or larger than expected.
-local function IsProbeableBlip(frame)
-    return frame:IsShown() and frame:GetScript("OnEnter") ~= nil
-end
-
 -- ============================================================
--- Glow creation / show / hide
+-- Pin pool
 -- ============================================================
 
-local function ShowGlow(blip)
-    if blip._lhm_glow then
-        blip._lhm_glow:Show()
-        blip._lhm_ag:Play()
-        return
-    end
+local function CreatePinFrame()
+    local pin = CreateFrame("Frame", nil, Minimap)
+    pin:SetSize(cfg.pinSize, cfg.pinSize)
+    pin:SetFrameStrata("HIGH")
+    pin:SetFrameLevel(10)
 
-    local w, h = blip:GetWidth(), blip:GetHeight()
-    local base = math.max(w, h, 8)
-    local sz   = base + cfg.glowExtra
+    local tex = pin:CreateTexture(nil, "OVERLAY", nil, 7)
+    tex:SetTexture("Interface\\Buttons\\WHITE8X8")
+    tex:SetAllPoints()
+    tex:SetVertexColor(cfg.glowR, cfg.glowG, cfg.glowB)
+    tex:SetBlendMode("ADD")
+    pin.tex = tex
 
-    local glow = blip:CreateTexture(nil, "OVERLAY", nil, 7)
-    glow:SetTexture("Interface\\Buttons\\WHITE8X8")
-    glow:SetSize(sz, sz)
-    glow:SetPoint("CENTER", blip, "CENTER", 0, 0)
-    glow:SetVertexColor(cfg.glowR, cfg.glowG, cfg.glowB)
-    glow:SetBlendMode("ADD")
-
-    local ag = glow:CreateAnimationGroup()
+    local ag = tex:CreateAnimationGroup()
     ag:SetLooping("BOUNCE")
-
     local anim = ag:CreateAnimation("Alpha")
     anim:SetFromAlpha(0.10)
     anim:SetToAlpha(cfg.glowAlpha)
     anim:SetDuration(cfg.pulseDuration)
     anim:SetSmoothing("IN_OUT")
+    pin.ag = ag
 
-    ag:Play()
-
-    blip._lhm_glow = glow
-    blip._lhm_ag   = ag
+    return pin
 end
 
-local function HideGlow(blip)
-    if blip._lhm_ag   then blip._lhm_ag:Stop()  end
-    if blip._lhm_glow then blip._lhm_glow:Hide() end
+local function AcquirePin()
+    local pin = table.remove(pinPool)
+    if not pin then pin = CreatePinFrame() end
+    pin:Show()
+    pin.ag:Play()
+    return pin
+end
+
+local function ReleasePin(pin)
+    pin.ag:Stop()
+    pin:Hide()
+    pin:ClearAllPoints()
+    table.insert(pinPool, pin)
 end
 
 -- ============================================================
--- Tooltip probing
+-- Minimap coordinate conversion
 -- ============================================================
--- Programmatically fire each blip's OnEnter with the tooltip
--- invisible, read the first line, then hide it.
 
-local function ProbeBlipTooltip(blip)
-    local onEnter = blip:GetScript("OnEnter")
-    if not onEnter then return nil end
+-- Outdoor minimap visible radius in yards (approximate, per zoom level).
+local YARD_RADIUS = {
+    [0] = 233, [1] = 200, [2] = 167, [3] = 133, [4] = 100, [5] = 67,
+}
 
-    -- Make tooltip invisible during probe so nothing flickers.
-    local prevAlpha = GameTooltip:GetAlpha()
-    GameTooltip:SetAlpha(0)
+local function GetMinimapYardRadius()
+    if C_Minimap and C_Minimap.GetViewRadius then
+        return C_Minimap.GetViewRadius()
+    end
+    return YARD_RADIUS[Minimap:GetZoom()] or 150
+end
 
-    local ok = pcall(onEnter, blip)
+--- Convert a world position to a pixel offset from Minimap center.
+--- Returns px, py  or  nil, nil if the point is outside the minimap.
+local function WorldToMinimapOffset(nodeX, nodeY)
+    -- UnitPosition returns (y, x, z, instanceID);  y increases south, x increases east(?).
+    local playerY, playerX = UnitPosition("player")
+    if not playerY then return nil, nil end
 
-    local text = ok and GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
+    local dx = nodeX - playerX      -- east-west
+    local dy = nodeY - playerY      -- north-south (positive = south)
 
-    GameTooltip:Hide()
-    GameTooltip:SetAlpha(prevAlpha)
+    local yardRadius = GetMinimapYardRadius()
+    local pixRadius  = Minimap:GetWidth() / 2
+    local scale      = pixRadius / yardRadius
 
-    if cfg.debug and text then
-        print(string.format("|cffff8000[LHM Debug]|r Probed: '%s' → lush=%s",
-            text, tostring(IsLushString(text))))
+    local pixX =  dx * scale
+    local pixY = -dy * scale         -- negate: south in world = down on screen
+
+    -- Rotate when the minimap rotates with the player.
+    if GetCVar("rotateMinimap") == "1" then
+        local facing = GetPlayerFacing() or 0
+        local s, c = math.sin(-facing), math.cos(-facing)
+        pixX, pixY = pixX * c - pixY * s,
+                     pixX * s + pixY * c
     end
 
-    if text then return IsLushString(text) end
-    return nil   -- couldn't determine
+    -- Clip to minimap circle.
+    if (pixX * pixX + pixY * pixY) > (pixRadius * pixRadius) then
+        return nil, nil
+    end
+
+    return pixX, pixY
 end
 
 -- ============================================================
--- Scanning
+-- Pin positioning (called every frame-ish)
 -- ============================================================
 
---- Remove glows on frames that have disappeared.
-local function Cleanup()
-    for blip in pairs(lushBlips) do
-        if not blip:IsShown() then
-            HideGlow(blip)
-            lushBlips[blip]   = nil
-            probedBlips[blip] = nil
-        end
-    end
-    -- Also drop stale probed entries for hidden frames.
-    for blip in pairs(probedBlips) do
-        if not blip:IsShown() then
-            probedBlips[blip] = nil
-        end
-    end
-end
+local function UpdatePins()
+    local _, _, _, currentInstance = UnitPosition("player")
+    if not currentInstance then return end
 
---- Probe blips we haven't checked yet (runs frequently).
-local function ProbeNewBlips()
-    for _, child in ipairs({Minimap:GetChildren()}) do
-        if child:IsShown() and not probedBlips[child] then
-            probedBlips[child] = true
+    local now = GetTime()
 
-            local w, h = child:GetWidth(), child:GetHeight()
-            local hasOnEnter = child:GetScript("OnEnter") ~= nil
+    for i = #detectedNodes, 1, -1 do
+        local node = detectedNodes[i]
+        local pin  = nodePins[node]
 
-            if cfg.debug then
-                print(string.format(
-                    "|cffff8000[LHM Debug]|r Child: size=%.0fx%.0f  OnEnter=%s  regions=%d  name=%s",
-                    w, h, tostring(hasOnEnter), child:GetNumRegions(),
-                    child:GetName() or "(nil)"))
+        -- Expire old entries or wrong-instance entries.
+        if now - node.time > cfg.expirySeconds
+           or node.instance ~= currentInstance then
+            if pin then ReleasePin(pin); nodePins[node] = nil end
+            table.remove(detectedNodes, i)
+        else
+            -- Ensure a pin exists for this node.
+            if not pin then
+                pin = AcquirePin()
+                nodePins[node] = pin
             end
 
-            if hasOnEnter then
-                local isLush = ProbeBlipTooltip(child)
-                if isLush then
-                    ShowGlow(child)
-                    lushBlips[child] = true
+            -- Reposition.
+            local px, py = WorldToMinimapOffset(node.x, node.y)
+            if px then
+                pin:ClearAllPoints()
+                pin:SetPoint("CENTER", Minimap, "CENTER", px, py)
+                if not pin:IsShown() then pin:Show() end
+            else
+                pin:Hide()
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- Tooltip hook  (detects Lush/Rich on world-object mouseover)
+-- ============================================================
+
+local function SetupTooltipHook()
+    GameTooltip:HookScript("OnShow", function()
+        local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
+        if not text or not IsLushString(text) then return end
+
+        -- UnitPosition returns (y, x, z, instanceID).
+        local uy, ux, _, instanceID = UnitPosition("player")
+        if not uy then return end
+
+        -- Deduplicate: refresh timestamp if we already track a node within 15 yd.
+        for _, node in ipairs(detectedNodes) do
+            if node.instance == instanceID then
+                local d = (node.x - ux) ^ 2 + (node.y - uy) ^ 2
+                if d < 225 then          -- 15^2
+                    node.time = GetTime() -- keep it alive
+                    return
                 end
             end
         end
-    end
-end
 
---- Clear the probed cache and re-check everything (handles frame recycling).
-local function FullReprobe()
-    -- Hide existing glows — they'll be re-applied if still lush.
-    for blip in pairs(lushBlips) do
-        HideGlow(blip)
-    end
-    wipe(lushBlips)
-    wipe(probedBlips)
+        -- New lush node.
+        table.insert(detectedNodes, {
+            x        = ux,
+            y        = uy,
+            instance = instanceID,
+            time     = GetTime(),
+            name     = text,
+        })
 
-    for _, child in ipairs({Minimap:GetChildren()}) do
-        if IsProbeableBlip(child) then
-            probedBlips[child] = true
-            local isLush = ProbeBlipTooltip(child)
-            if isLush then
-                ShowGlow(child)
-                lushBlips[child] = true
-            end
+        if cfg.debug then
+            print(string.format(
+                "|cffff8000[LHM Debug]|r Lush detected: '%s' at world (%.0f, %.0f)",
+                text, ux, uy))
         end
-    end
+    end)
 end
 
 -- ============================================================
--- Events
+-- Events & OnUpdate
 -- ============================================================
+
 eventFrame:RegisterEvent("ADDON_LOADED")
-eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
-eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
@@ -206,40 +232,25 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
             if LHM_Config[k] == nil then LHM_Config[k] = v end
         end
         cfg = LHM_Config
-        print("|cff00cc44[Lush Herbs & Mining]|r loaded. Type |cffffff00/lhm help|r for commands.")
-
-    elseif event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
-        -- Full reset on zone change.
-        for blip in pairs(lushBlips) do HideGlow(blip) end
-        wipe(lushBlips)
-        wipe(probedBlips)
+        SetupTooltipHook()
+        print("|cff00cc44[Lush Herbs & Mining]|r loaded.  Hover over world nodes to detect Lush/Rich.")
+        print("  Type |cffffff00/lhm help|r for commands.")
     end
 end)
 
--- Timers: quick probe for new blips, periodic full re-probe, cleanup.
+local updateThrottle = 0
 eventFrame:SetScript("OnUpdate", function(self, elapsed)
     if not cfg then return end
-
-    probeTimer   = probeTimer + elapsed
-    reprobeTimer = reprobeTimer + elapsed
-
-    -- Cleanup hidden frames every probe cycle.
-    if probeTimer >= cfg.probeInterval then
-        probeTimer = 0
-        Cleanup()
-        ProbeNewBlips()
-    end
-
-    -- Full re-probe (handles WoW recycling blip frames for different nodes).
-    if reprobeTimer >= cfg.reprobeInterval then
-        reprobeTimer = 0
-        FullReprobe()
-    end
+    updateThrottle = updateThrottle + elapsed
+    if updateThrottle < 0.05 then return end   -- ~20 updates/sec
+    updateThrottle = 0
+    UpdatePins()
 end)
 
 -- ============================================================
 -- Slash commands
 -- ============================================================
+
 SLASH_LHM1 = "/lhm"
 SlashCmdList["LHM"] = function(msg)
     if not cfg then return end
@@ -247,41 +258,37 @@ SlashCmdList["LHM"] = function(msg)
 
     if cmd == "debug" then
         cfg.debug = not cfg.debug
-        print(string.format(
-            "|cff00cc44[LHM]|r Debug mode |cffffffff%s|r.",
+        print(string.format("|cff00cc44[LHM]|r Debug mode |cffffffff%s|r.",
             cfg.debug and "ON" or "OFF"))
 
-    elseif cmd == "scan" then
-        FullReprobe()
-        print("|cff00cc44[LHM]|r Full re-probe complete.")
-
     elseif cmd == "clear" then
-        for blip in pairs(lushBlips) do HideGlow(blip) end
-        wipe(lushBlips)
-        wipe(probedBlips)
-        print("|cff00cc44[LHM]|r Cleared all highlights.")
+        for _, pin in pairs(nodePins) do ReleasePin(pin) end
+        wipe(nodePins)
+        wipe(detectedNodes)
+        print("|cff00cc44[LHM]|r Cleared all tracked Lush positions.")
 
     elseif cmd:match("^color%s+") then
         local r, g, b = cmd:match("color%s+([%d.]+)%s+([%d.]+)%s+([%d.]+)")
         r, g, b = tonumber(r), tonumber(g), tonumber(b)
         if r and g and b then
             cfg.glowR, cfg.glowG, cfg.glowB = r, g, b
-            for blip in pairs(lushBlips) do
-                if blip._lhm_glow then
-                    blip._lhm_glow:SetVertexColor(r, g, b)
-                end
+            for _, pin in pairs(nodePins) do
+                if pin.tex then pin.tex:SetVertexColor(r, g, b) end
             end
             print(string.format("|cff00cc44[LHM]|r Glow colour set to (%.2f, %.2f, %.2f).", r, g, b))
         else
             print("|cff00cc44[LHM]|r Usage: /lhm color <R> <G> <B>  (0–1 each)")
         end
 
+    elseif cmd == "count" then
+        print(string.format("|cff00cc44[LHM]|r Tracking %d Lush/Rich node(s).", #detectedNodes))
+
     elseif cmd == "help" or cmd == "" then
         print("|cff00cc44[LHM] Lush Herbs & Mining|r – commands:")
-        print("  |cffffff00/lhm debug|r            toggle debug (prints tooltip probe results)")
-        print("  |cffffff00/lhm scan|r              force a full re-probe now")
-        print("  |cffffff00/lhm clear|r            clear all highlights")
-        print("  |cffffff00/lhm color <R> <G> <B>|r set glow colour (0–1 each)")
+        print("  |cffffff00/lhm debug|r            toggle debug output")
+        print("  |cffffff00/lhm clear|r            clear all tracked positions")
+        print("  |cffffff00/lhm color <R> <G> <B>|r set pin colour (0–1 each)")
+        print("  |cffffff00/lhm count|r            how many nodes are tracked")
         print("  |cffffff00/lhm help|r              show this message")
     else
         print("|cff00cc44[LHM]|r Unknown command. Type |cffffff00/lhm help|r for options.")
